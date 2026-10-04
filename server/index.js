@@ -1040,11 +1040,23 @@ app.get('/api/reports/:id/field-csv', (req, res) => {
 });
 
 // 多份选定报告导出：{ ids: string[], format: 'csv' | 'png' | 'zip' }
+// 全部校验（格式 / 空选择 / 50 份上限 / 标识合法 / 报告存在）都在下载开始前完成，
+// 不静默漏掉任何报告；ZIP 按选中顺序逐份渲染标注 PNG 并流式写入（见 exporter.streamZip），
+// 峰值 PNG 缓存不随报告份数增长。
 app.post('/api/reports/export', async (req, res) => {
   const { ids, format } = req.body || {};
+  if (format !== 'csv' && format !== 'png' && format !== 'zip') {
+    return badRequest(res, "format 必须是 'csv'、'png' 或 'zip'");
+  }
   if (!Array.isArray(ids) || ids.length === 0) return badRequest(res, '请至少选择一份报告');
+  if (ids.length > 50) {
+    return badRequest(res, `一次最多导出 50 份报告（当前选择 ${ids.length} 份），请减少选择后重试`);
+  }
+  if (ids.some((id) => typeof id !== 'string' || !id)) {
+    return badRequest(res, '报告选择无效：ids 必须全部由非空报告 id 字符串组成');
+  }
   const reports = [];
-  for (const id of ids.slice(0, 50)) {
+  for (const id of ids) {
     const r = getReportOr404(id);
     if (!r) return badRequest(res, `报告 ${id} 不存在或已被删除`);
     reports.push(r);
@@ -1071,16 +1083,11 @@ app.post('/api/reports/export', async (req, res) => {
       return res.send(buf);
     }
 
-    if (format === 'zip') {
-      const pngByName = {};
-      for (const r of reports) {
-        const row = db.prepare('SELECT snapshot_name FROM reports WHERE id = ?').get(r.id);
-        pngByName[r.id] = await renderAnnotatedPng(path.join(SNAP_DIR, row.snapshot_name), r);
-      }
-      return streamZip(reports, pngByName, res);
-    }
-
-    return badRequest(res, "format 必须是 'csv'、'png' 或 'zip'");
+    // format === 'zip'：逐份渲染 → 写入 → 释放；渲染/压缩失败或客户端取消由 streamZip 处理
+    return await streamZip(reports, async (r) => {
+      const row = db.prepare('SELECT snapshot_name FROM reports WHERE id = ?').get(r.id);
+      return renderAnnotatedPng(path.join(SNAP_DIR, row.snapshot_name), r);
+    }, res);
   } catch (e) {
     if (!res.headersSent) res.status(500).json({ error: `导出失败：${e.message}` });
   }

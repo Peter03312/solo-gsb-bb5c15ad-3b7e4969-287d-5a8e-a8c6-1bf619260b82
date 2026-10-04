@@ -63,7 +63,12 @@ function buildCombinedCsv(reports) {
   return '﻿' + rows.map((r) => r.map(csvCell).join(',')).join('\r\n');
 }
 
-async function streamZip(reports, pngByName, res) {
+// 多份报告 ZIP 导出（流式）：按选中顺序逐份渲染标注 PNG、立即写入 ZIP 流，
+// 等该份条目被压缩消费后再渲染下一份——任意时刻内存中至多约一份 PNG 缓存，
+// 峰值不随报告份数增长。条目名称/内容/顺序、ZIP 文件名、汇总 CSV 与 zlib 级别
+// 均与原有实现一致；数据仍来自各报告发布时的冻结快照。
+// renderPng：async (report) => Buffer，渲染单份报告的标注 PNG。
+async function streamZip(reports, renderPng, res) {
   const archive = archiver('zip', { zlib: { level: 9 } });
   const names = new Set();
   const uniq = (n) => {
@@ -73,20 +78,77 @@ async function streamZip(reports, pngByName, res) {
     return name;
   };
 
+  let clientGone = false; // 浏览器取消下载：连接在响应正常结束前被关闭
+  let failed = false;     // 渲染/压缩失败：已中止响应
+  let entriesDone = 0;    // 已被压缩模块消费的条目数（archiver entry 事件计数）
+  let waiter = null;
+  const wake = () => { const w = waiter; waiter = null; if (w) w(); };
+  const stopArchive = () => {
+    try { archive.unpipe(res); } catch { /* 清理阶段的异常忽略 */ }
+    try { archive.abort(); } catch { /* 清理阶段的异常忽略 */ }
+  };
+
+  // 客户端断开（取消下载）：停止后续生成并释放压缩资源
+  res.on('close', () => {
+    if (!res.writableFinished) {
+      clientGone = true;
+      stopArchive();
+      wake();
+    }
+  });
+
+  const fail = (err) => {
+    if (failed || clientGone || res.writableFinished) return;
+    failed = true;
+    stopArchive();
+    // 已开始传输：销毁连接中止下载，绝不交付「状态成功但内容残缺」的 ZIP；
+    // 尚未写出任何字节（首份渲染即失败）时才能回 JSON 错误
+    if (res.headersSent) res.destroy();
+    else res.status(500).json({ error: `导出失败：${err.message}` });
+    wake();
+  };
+  archive.on('error', fail);
+  archive.on('entry', () => { entriesDone += 1; wake(); });
+
+  // 等第 target 个条目被压缩消费后再继续：PNG 缓存随渲染逐份产生、逐份释放
+  const waitEntries = (target) => new Promise((resolve) => {
+    const check = () => {
+      if (entriesDone >= target || clientGone || failed) resolve();
+      else waiter = check;
+    };
+    check();
+  });
+
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('Content-Disposition', 'attachment; filename="reports.zip"');
-  archive.on('error', (err) => { res.destroy(err); });
   archive.pipe(res);
 
-  const combined = [];
-  for (const r of reports) {
-    const base = uniq(`${r.title || r.id}`.replace(/[\\/:*?"<>|]+/g, '_'));
-    archive.append(pngByName[r.id], { name: `${base}_标注.png` });
-    archive.append(buildReportCsv(r), { name: `${base}_测量.csv` });
-    combined.push(r);
+  try {
+    const combined = [];
+    for (const r of reports) {
+      if (clientGone || failed) return;
+      let png;
+      try {
+        png = await renderPng(r); // 一次只渲染一份报告的标注 PNG
+      } catch (e) {
+        fail(new Error(`报告《${r.title || r.id}》标注图片生成失败：${e.message}`));
+        return;
+      }
+      if (clientGone || failed) return;
+      const base = uniq(`${r.title || r.id}`.replace(/[\\/:*?"<>|]+/g, '_'));
+      const target = entriesDone + 2;
+      archive.append(png, { name: `${base}_标注.png` });
+      archive.append(buildReportCsv(r), { name: `${base}_测量.csv` });
+      png = null; // 本份 PNG 缓存交予压缩流；条目被消费后即可回收
+      combined.push(r);
+      await waitEntries(target);
+    }
+    if (clientGone || failed) return;
+    archive.append(buildCombinedCsv(combined), { name: '汇总_测量.csv' });
+    await archive.finalize();
+  } catch (e) {
+    fail(e);
   }
-  archive.append(buildCombinedCsv(combined), { name: '汇总_测量.csv' });
-  await archive.finalize();
 }
 
 // 比较记录 CSV：与页面结构一致——两侧定标信息、配对细胞（两侧数值/带符号差值/相对基线变化率）、

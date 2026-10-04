@@ -177,7 +177,14 @@ const Reports = {
       alert(msg);
       return;
     }
-    const blob = await res.blob();
+    let blob;
+    try {
+      blob = await res.blob();
+    } catch {
+      // 传输中失败：服务端已中止响应，残缺的 ZIP 绝不落盘
+      alert('导出失败：下载被中止（服务端在传输中遇到错误），未保存任何文件，请重试');
+      return;
+    }
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = fallbackName;

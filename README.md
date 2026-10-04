@@ -85,7 +85,8 @@
    - 单份或多份合并的**测量 CSV**（UTF-8 BOM，Excel 直接可读，含义保持不变）；
    - 单份报告的**视野统计 CSV**（与报告页表格为**同一份冻结结果**；旧报告无视野时仅表头+空提示）；
    - 单份**标注 PNG**（彩色细胞轮廓、红色虚线孔洞、细胞编号与青色标尺）；
-   - 多份报告的 **ZIP**（每份一张标注 PNG + 一份 CSV，外附汇总 CSV）。
+   - 多份报告的 **ZIP**（每份一张标注 PNG + 一份 CSV，外附汇总 CSV；按选中顺序
+     **逐份生成、流式写入并释放**，峰值 PNG 缓存不随份数增长，见功能 21）。
 9. **报告比较（基线 ↔ 复测）**：在「报告比较」页选择**两份不同**的已发布报告，
    先点基线侧一个细胞、再点复测侧一个细胞，**手动**建立一对一配对
    （**同名细胞不会自动配对**；已配对细胞从两侧待选列表移除，可随时「解除」）。
@@ -382,12 +383,78 @@
     }
     ```
 
+21. **批量 ZIP 导出流式化（本轮）**：多份报告的 ZIP 导出曾先把全部选中报告的标注 PNG
+    一次性渲染进内存（`pngByName` 字典）再打包——选择多份大图报告时，峰值 PNG 缓存随
+    报告份数线性增长。本轮在**不改表结构、不改启动方式、不改变既有导出契约**的前提下，
+    改为**按选中顺序逐份生成、写入并释放**：逐份渲染该报告的标注 PNG → 立即把
+    `<标题>_标注.png` 与 `<标题>_测量.csv` 两个条目写入 ZIP 流 → 等它们被压缩消费后
+    再渲染下一份；任意时刻内存中至多约一份标注 PNG，**峰值 PNG 缓存不再随报告份数增长**。
+    - **对外契约完全不变**：请求字段（`ids`、`format`）、ZIP 文件名（`reports.zip`）、
+      每份 `<标题>_标注.png` / `<标题>_测量.csv` 与末尾 `汇总_测量.csv` 的名称、内容、
+      排列顺序、同名标题 `_1`/`_2` 去重规则、zlib 压缩级别均与此前一致；数据仍全部来自
+      各报告**发布时的冻结快照**（后续草稿修改/更正不影响导出内容）；重复选择同一报告
+      仍各出一份（名称去重）；单份 PNG、单份/合并 CSV 导出行为不变；
+    - **下载开始前明确拒绝（400，不静默漏掉报告）**：`format` 无效、选择为空、
+      超过 **50 份**上限（此前静默截断为前 50 份，本轮起明确拒绝并指明份数）、
+      `ids` 含非字符串、任一报告不存在——全部在写出任何字节前返回 JSON 错误；
+    - **传输中失败即中止**：某份标注 PNG 渲染失败或压缩出错时，若响应已开始传输，
+      立即销毁连接中止下载（浏览器表现为下载中断），**绝不交付状态成功但内容残缺的
+      ZIP**；若首份渲染即失败（尚未写出任何字节），返回 **500 JSON** 错误；
+      前端 `下载` 在传输中断时明确提示、不保存残缺文件；
+    - **浏览器取消即停止**：客户端中途断开（取消下载）时，停止后续报告的渲染与压缩，
+      释放压缩流资源，不再做无效工作；
+    - **自测**：`node test-export-zip-api.js`（已并入 `npm test`）覆盖逐份生成/释放
+      （任意时刻至多一份渲染在途、上一份条目写入后才渲染下一份）、ZIP 条目名称/内容/
+      顺序与单份导出逐字节一致、50 份上限边界、五类下载前拒绝、传输中失败中止、
+      首份失败 500、客户端取消后停止生成且服务保持可用。
+
+    调用示例（批量 ZIP 导出）：
+
+    ```bash
+    # 1) 选择两份报告导出 ZIP（每份一张标注 PNG + 一份测量 CSV，外附汇总 CSV）
+    curl -s -X POST http://localhost:8080/api/reports/export \
+      -H 'Content-Type: application/json' \
+      -d "{\"ids\":[\"$RID1\",\"$RID2\"],\"format\":\"zip\"}" \
+      -o reports.zip
+
+    # 2) 下载开始前明确拒绝：空选择 / 超 50 份 / 格式无效 / 报告不存在 → 400
+    curl -s -X POST http://localhost:8080/api/reports/export \
+      -H 'Content-Type: application/json' -d '{"ids":[],"format":"zip"}'
+    # -> { "error": "请至少选择一份报告" }
+    curl -s -X POST http://localhost:8080/api/reports/export \
+      -H 'Content-Type: application/json' \
+      -d '{"ids":["'$RID1'","no-such"],"format":"zip"}'
+    # -> { "error": "报告 no-such 不存在或已被删除" }
+    ```
+
+    Node.js 示例（无第三方依赖；流式落盘，传输中断即抛错、不留残缺文件）：
+
+    ```js
+    const fs = require('fs');
+    const { Readable } = require('stream');
+    const { pipeline } = require('stream/promises');
+
+    async function exportZip(reportIds, outPath) {
+      const res = await fetch('http://localhost:8080/api/reports/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: reportIds, format: 'zip' })
+      });
+      if (!res.ok) throw new Error((await res.json()).error); // 400：选择/格式/报告问题
+      // 传输中失败时服务端会中止响应：pipeline 抛错，不会留下「成功外观」的残缺 ZIP
+      await pipeline(Readable.fromWeb(res.body), fs.createWriteStream(outPath));
+    }
+
+    await exportZip([process.env.RID1, process.env.RID2], 'reports.zip');
+    ```
+
 ## 配置项
 
-本轮（轮廓/视野保存以写入坐标为准校验）**未引入新的环境变量、外部依赖或表结构变更**，
-也**不做任何启动时数据迁移**：既有草稿、修订与已发布报告原样保留，仅保存接口在
-三位小数取整后增加一次以实际写入坐标为准的几何校验；`npm start` / Docker Compose 的
-启动方式保持可用。上一轮（视野 id 身份歧义修复）同样未引入配置变更。此前各轮的幂等迁移
+本轮（批量 ZIP 导出流式化）**未引入新的环境变量、外部依赖或表结构变更**，
+也**不做任何启动时数据迁移**：仅改变 ZIP 导出的内存流水线（逐份生成、写入并释放）
+与请求校验（超过 50 份由静默截断改为明确拒绝）；`npm start` / Docker Compose 的
+启动方式保持可用。此前两轮（轮廓/视野保存以写入坐标为准校验、视野 id 身份歧义修复）
+同样未引入配置变更。更早各轮的幂等迁移
 （`fields`、`corrects_report_id`、`correction_reason` 列）在旧数据库启动时自动完成、无需手工变更。
 沿用既有配置：
 
@@ -534,7 +601,7 @@ npm start
 │   ├── field-zones.js # 报告单视野最近质心责任区：Voronoi 半平面求交 × 视野净区域平面排列、面积/占比/实际分区（只读）
 │   ├── field-identity.js # 视野 id 身份歧义：保存前批次唯一性校验、重复 id 冲突定位、按 id/名称分析的拒绝判定（不改写历史数据）
 │   ├── render.js      # sharp + SVG 渲染标注 PNG
-│   └── exporter.js    # CSV（测量/汇总/视野统计/比较）与 ZIP 导出
+│   └── exporter.js    # CSV（测量/汇总/视野统计/比较）与 ZIP 导出（按选中顺序逐份生成、流式写入并释放）
 ├── public/            # 前端（原生 JS，无需构建）
 ├── test-geometry.js   # 几何自测（npm test）
 ├── test-fields.js     # 视野密度统计自测（npm test）
@@ -553,6 +620,7 @@ npm start
 ├── test-field-zones-api.js # 最近质心责任区端到端 HTTP 自测（npm test，临时目录起服务）
 ├── test-field-identity-api.js # 视野 id 身份歧义修复端到端 HTTP 自测（npm test，临时目录起服务）
 ├── test-save-rounding-api.js # 轮廓/视野保存按写入坐标（三位小数）校验端到端 HTTP 自测（npm test，临时目录起服务）
+├── test-export-zip-api.js # 批量 ZIP 导出流式化端到端 HTTP 自测（npm test，临时目录起服务）
 └── data/              # 运行后生成：app.db、images/、snapshots/
 ```
 
@@ -1749,5 +1817,5 @@ await fieldZones(process.env.RID, 'fieldF');
 | `GET /api/reports/:id/file` / `/png` | 发布时图片快照 / 标注 PNG |
 | `GET /api/reports/:id/csv` | 测量 CSV（μm²，原义不变） |
 | **`GET /api/reports/:id/field-csv`** | **视野统计 CSV（mm²，与报告页同一冻结结果）** |
-| `POST /api/reports/export` | 批量导出 `{ids, format:'csv'\|'png'\|'zip'}` |
+| **`POST /api/reports/export`** | **批量导出 `{ids, format:'csv'\|'png'\|'zip'}`；ZIP 按选中顺序逐份生成、流式写入并释放 PNG 缓存（峰值不随份数增长），条目名称/内容/顺序不变；空选择/超 50 份/格式无效/报告不存在 → 400；传输中失败即中止，浏览器取消即停止** |
 | `GET/POST /api/comparisons`、`GET/PUT /api/comparisons/:id`、`GET /api/comparisons/:id/csv` | 报告比较（见上表） |
