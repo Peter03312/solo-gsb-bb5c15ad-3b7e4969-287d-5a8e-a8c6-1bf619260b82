@@ -86,6 +86,11 @@
    - 单份报告的**视野统计 CSV**（与报告页表格为**同一份冻结结果**；旧报告无视野时仅表头+空提示）；
    - 单份**标注 PNG**（彩色细胞轮廓、红色虚线孔洞、细胞编号与青色标尺）；
    - 多份报告的 **ZIP**（每份一张标注 PNG + 一份 CSV，外附汇总 CSV）。
+     ZIP 按**勾选顺序逐份流式导出**：逐份渲染标注 PNG → 写入压缩流 → 立即释放该份 PNG
+     缓存，**峰值 PNG 缓存不随报告份数增长**（任意时刻至多驻留当前一份）；数据全部取
+     各报告**发布时的冻结快照**。选择为空、**超过 50 份上限**、格式无效或有报告不存在时
+     在下载开始前以 4xx JSON 明确拒绝（不静默漏报告）；传输中图片生成/压缩失败会**中止响应、
+     不交付残缺 ZIP**；浏览器取消下载即停止后续生成并清理资源。
 9. **报告比较（基线 ↔ 复测）**：在「报告比较」页选择**两份不同**的已发布报告，
    先点基线侧一个细胞、再点复测侧一个细胞，**手动**建立一对一配对
    （**同名细胞不会自动配对**；已配对细胞从两侧待选列表移除，可随时「解除」）。
@@ -534,7 +539,7 @@ npm start
 │   ├── field-zones.js # 报告单视野最近质心责任区：Voronoi 半平面求交 × 视野净区域平面排列、面积/占比/实际分区（只读）
 │   ├── field-identity.js # 视野 id 身份歧义：保存前批次唯一性校验、重复 id 冲突定位、按 id/名称分析的拒绝判定（不改写历史数据）
 │   ├── render.js      # sharp + SVG 渲染标注 PNG
-│   └── exporter.js    # CSV（测量/汇总/视野统计/比较）与 ZIP 导出
+│   └── exporter.js    # CSV（测量/汇总/视野统计/比较）与 ZIP 流式导出（逐份渲染/释放 PNG，失败即中止）
 ├── public/            # 前端（原生 JS，无需构建）
 ├── test-geometry.js   # 几何自测（npm test）
 ├── test-fields.js     # 视野密度统计自测（npm test）
@@ -553,6 +558,7 @@ npm start
 ├── test-field-zones-api.js # 最近质心责任区端到端 HTTP 自测（npm test，临时目录起服务）
 ├── test-field-identity-api.js # 视野 id 身份歧义修复端到端 HTTP 自测（npm test，临时目录起服务）
 ├── test-save-rounding-api.js # 轮廓/视野保存按写入坐标（三位小数）校验端到端 HTTP 自测（npm test，临时目录起服务）
+├── test-export-zip-api.js # 批量 ZIP 流式导出端到端 HTTP/单元自测（npm test）：选择顺序逐份渲染且峰值 PNG ≤1、空/超 50/格式/不存在下载前拒绝、传输失败与浏览器取消中止
 └── data/              # 运行后生成：app.db、images/、snapshots/
 ```
 
@@ -1718,6 +1724,104 @@ await fieldZones(process.env.RID, 'fieldF');
 结果表格右侧即在报告快照上叠加各细胞实际分区（颜色按细胞）、孔洞透明与计入细胞质心品红点，
 **点击快照上的分区**或表格行可高亮定位（再点一次取消）。
 
+## 已发布报告批量导出 HTTP 接口（CSV / PNG / ZIP）
+
+页面入口：「已发布报告」页勾选若干报告后点「导出 CSV / 导出 ZIP / 单份标注 PNG」。
+接口与启动方式不变：`POST /api/reports/export`，请求体 `{ "ids": string[], "format": "csv"|"png"|"zip" }`，
+所有数据均取**各报告发布时的冻结快照**（图片副本、定标、细胞轮廓与统计），草稿后续改动不影响导出。
+
+| `format` | 选择份数 | 响应 |
+| --- | --- | --- |
+| `csv` | 1 份 | 该份测量 CSV（`<报告id>_measurements.csv`） |
+| `csv` | 2～50 份 | 合并测量 CSV（`measurements_combined.csv`） |
+| `png` | 仅 1 份 | 该份标注 PNG（`<报告id>_annotated.png`） |
+| `zip` | 1～50 份 | `reports.zip`：每份 `<标题>_标注.png` + `<标题>_测量.csv`，末尾 `汇总_测量.csv` |
+
+### 本轮 ZIP 导出行为（流式、低峰值内存）
+
+- **按 `ids` 所选顺序逐份**渲染标注 PNG → 追加进 ZIP 压缩流 → 该份 PNG 条目被压缩消费后
+  **立即释放其缓存**，再渲染下一份；任意时刻内存中至多保留当前一份 PNG，
+  **峰值 PNG 缓存不随报告份数线性增长**（旧实现先把全部 PNG 留在内存再打包）。
+- ZIP 文件名仍为 **`reports.zip`**；每份标注 PNG、测量 CSV 与末尾汇总 CSV 的
+  **名称、内容、顺序完全保持兼容**（同名标题仍按原规则加 `_1/_2…` 去重）。
+- **下载开始前**完成全部合法性校验并以 JSON 明确拒绝（此时尚未发送任何 ZIP 字节）：
+  - `ids` 为空或不是数组 → `400`「请至少选择一份报告」；
+  - **超过 50 份上限 → `400`**（旧实现只取前 50 份、静默漏掉其余；本轮整批拒绝）；
+  - `ids` 含非字符串/空白标识 → `400`；
+  - 任一报告不存在或已删除 → `400` 并指出该标识（**不截断、不漏报告**）；
+  - `format` 非 `csv/png/zip` → `400`；`png` 选了多份 → `400`。
+- **传输中失败**：某份 PNG 生成（sharp）或压缩在已开始下载后失败，服务端 **abort 归档并
+  中断连接**，响应不会是一个外观成功却缺条目/无法解压的 ZIP（客户端表现为连接错误/解压失败）。
+- **浏览器取消下载**：服务端检测到连接关闭后**停止后续 PNG 生成、中止归档并释放资源**；
+  下一次导出请求不受影响。
+
+### 调用示例（curl）
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 列出已发布报告，拿到 id（也可在页面勾选顺序中得到）
+curl -s "$BASE/api/reports" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{
+  JSON.parse(d).forEach(r=>console.log(r.id, r.title))})"
+
+# 2) 多份导出 ZIP（顺序即 ids 顺序；最多 50 份）
+curl -sS -X POST "$BASE/api/reports/export" \
+  -H 'Content-Type: application/json' \
+  -d '{"ids":["<报告ID1>","<报告ID2>","<报告ID3>"],"format":"zip"}' \
+  -o reports.zip
+unzip -l reports.zip
+#  报告A_标注.png
+#  报告A_测量.csv
+#  报告B_标注.png
+#  报告B_测量.csv
+#  报告C_标注.png
+#  报告C_测量.csv
+#  汇总_测量.csv
+
+# 3) 多份合并 CSV / 单份测量 CSV
+curl -sS -X POST "$BASE/api/reports/export" \
+  -H 'Content-Type: application/json' \
+  -d '{"ids":["<报告ID1>","<报告ID2>"],"format":"csv"}' -o measurements_combined.csv
+curl -sS -X POST "$BASE/api/reports/export" \
+  -H 'Content-Type: application/json' \
+  -d '{"ids":["<报告ID1>"],"format":"csv"}' -o one_measurements.csv
+
+# 4) 单份标注 PNG（多份会被 400 拒绝）
+curl -sS -X POST "$BASE/api/reports/export" \
+  -H 'Content-Type: application/json' \
+  -d '{"ids":["<报告ID1>"],"format":"png"}' -o annotated.png
+
+# 5) 下载开始前的拒绝示例（均为 400 + JSON，不会产生 ZIP）
+#   {"error":"批量导出最多选择 50 份报告（当前选择 51 份），请求被拒绝"}
+curl -sS -X POST "$BASE/api/reports/export" -H 'Content-Type: application/json' \
+  -d '{"ids":["<ID>","<不存在的ID>"],"format":"zip"}'
+#   {"error":"报告 <不存在的ID> 不存在或已被删除"}
+```
+
+### 调用示例（Node.js，流式落盘 + 错误/取消处理）
+
+```js
+// 大份 ZIP 直接 pipe 到文件：校验失败时收到的是 JSON，不会得到空/残 ZIP
+const res = await fetch('http://localhost:8080/api/reports/export', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ ids: ids, format: 'zip' }) // ids：按希望的 ZIP 顺序，1～50 个
+});
+if (!res.ok) {
+  const { error } = await res.json(); // 空选择/超 50/格式无效/报告不存在
+  throw new Error(`导出被拒绝：${error}`);
+}
+const out = require('fs').createWriteStream('reports.zip');
+await new Promise((resolve, reject) => {
+  // 传输中断（服务端 PNG/压缩失败）会在 stream 上触发 error，不会写出“成功外观”的残 ZIP
+  res.body.pipe(out);
+  res.body.on('error', reject);
+  out.on('finish', resolve);
+});
+// 用户主动取消：controller.abort() —— 服务端随即停止后续 PNG 生成并清理资源
+// const controller = new AbortController(); fetch(url, { ..., signal: controller.signal });
+```
+
 ## 全部 HTTP 接口一览（既有 + 本轮）
 
 | 方法与路径 | 说明 |
@@ -1749,5 +1853,5 @@ await fieldZones(process.env.RID, 'fieldF');
 | `GET /api/reports/:id/file` / `/png` | 发布时图片快照 / 标注 PNG |
 | `GET /api/reports/:id/csv` | 测量 CSV（μm²，原义不变） |
 | **`GET /api/reports/:id/field-csv`** | **视野统计 CSV（mm²，与报告页同一冻结结果）** |
-| `POST /api/reports/export` | 批量导出 `{ids, format:'csv'\|'png'\|'zip'}` |
+| **`POST /api/reports/export`** | **批量导出 `{ids, format:'csv'\|'png'\|'zip'}`（1～50 份；空/超上限/格式无效/报告不存在 → 下载开始前 400；ZIP 按所选顺序逐份渲染并释放 PNG，峰值缓存不随份数增长；传输中失败/浏览器取消均中止，不交付残 ZIP）** |
 | `GET/POST /api/comparisons`、`GET/PUT /api/comparisons/:id`、`GET /api/comparisons/:id/csv` | 报告比较（见上表） |

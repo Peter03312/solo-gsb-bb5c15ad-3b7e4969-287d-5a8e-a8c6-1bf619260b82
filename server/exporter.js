@@ -63,8 +63,17 @@ function buildCombinedCsv(reports) {
   return '﻿' + rows.map((r) => r.map(csvCell).join(',')).join('\r\n');
 }
 
-async function streamZip(reports, pngByName, res) {
+// 多份报告的 ZIP：按所选顺序逐份生成标注 PNG、写入压缩流后立即释放该份 PNG 缓存，
+// 任何时刻内存中至多保留当前一份 PNG（压缩由 archiver 的 1MB 内部缓冲背压），
+// 峰值 PNG 缓存不随报告份数增长。renderPng(report) 由调用方提供，数据取报告发布时
+// 的冻结快照。所有请求合法性（空选择/超上限/格式/报告不存在）必须在调用前校验完毕。
+//
+// 传输期失败语义：PNG 生成或压缩出错 → abort 归档并 destroy 响应，不产出残缺 ZIP；
+// 浏览器取消下载（res 'close'）→ 中止后续生成并释放资源。
+// onArchive 为可选观测钩子（传入创建好的 archive），供调用方挂进度/日志监听。
+async function streamZip(reports, renderPng, res, onArchive = null) {
   const archive = archiver('zip', { zlib: { level: 9 } });
+  if (typeof onArchive === 'function') onArchive(archive);
   const names = new Set();
   const uniq = (n) => {
     let name = n; let k = 1;
@@ -75,18 +84,83 @@ async function streamZip(reports, pngByName, res) {
 
   res.setHeader('Content-Type', 'application/zip');
   res.setHeader('Content-Disposition', 'attachment; filename="reports.zip"');
-  archive.on('error', (err) => { res.destroy(err); });
+
+  let stopped = false;
+  let stopReason = null;
+  const activeEntryListeners = new Set();
+  const stop = (reason) => {
+    if (stopped) return;
+    stopped = true;
+    stopReason = reason || null;
+    archive.abort();
+    // 解除所有等待 'entry' 的 gate（abort 后队列中条目不再产生 'entry'）
+    for (const fn of activeEntryListeners) {
+      archive.removeListener('entry', fn);
+      fn();
+    }
+    activeEntryListeners.clear();
+    if (!res.destroyed) res.destroy(reason instanceof Error ? reason : undefined);
+  };
+  // 压缩期错误（含 PNG 已入队后的压缩错误）：中止响应，不能交付残缺 ZIP
+  archive.on('error', (err) => stop(err));
+  // 浏览器取消下载：关闭且未正常写完即中止（destroy() 会先置位 destroyed 再触发 close）
+  res.on('close', () => { if (!res.writableEnded) stop(); });
   archive.pipe(res);
 
-  const combined = [];
-  for (const r of reports) {
-    const base = uniq(`${r.title || r.id}`.replace(/[\\/:*?"<>|]+/g, '_'));
-    archive.append(pngByName[r.id], { name: `${base}_标注.png` });
-    archive.append(buildReportCsv(r), { name: `${base}_测量.csv` });
-    combined.push(r);
+  // 等当前条目（PNG/CSV）被压缩消费后再生成下一份 PNG，保证同时只有一份 PNG 驻留内存。
+  // 必须在 archive.append 前挂监听，避免条目在同一事件循环内被消费时错过事件；
+  // stop()（压缩错误/客户端取消）也会解除等待，由调用方检查 stopped 收尾。
+  const entryGate = () => new Promise((resolve) => {
+    const onEntry = () => {
+      activeEntryListeners.delete(onEntry);
+      archive.removeListener('entry', onEntry);
+      resolve();
+    };
+    activeEntryListeners.add(onEntry);
+    archive.on('entry', onEntry);
+  });
+
+  try {
+    for (const r of reports) {
+      const base = uniq(`${r.title || r.id}`.replace(/[\\/:*?"<>|]+/g, '_'));
+      const pngName = `${base}_标注.png`;
+      const csvName = `${base}_测量.csv`;
+
+      // 1) 仅生成当前这一份标注 PNG（冻结快照）
+      let png;
+      try {
+        png = await renderPng(r);
+      } catch (err) {
+        stop(err); // 图片生成失败：中止响应，不写出本份条目
+        return { aborted: true, reason: err };
+      }
+      if (stopped) return { aborted: true, reason: stopReason };
+
+      // 2) 把 PNG 交给压缩流；条目被压缩消费（'entry'）前不生成下一份
+      let gate = entryGate();
+      archive.append(png, { name: pngName });
+      await gate;
+      png = null; // 立即释放本份 PNG 缓存
+      if (stopped) return { aborted: true, reason: stopReason };
+
+      // 3) 同一份的测量 CSV（体积小，与原顺序一致：PNG 后紧跟 CSV）
+      gate = entryGate();
+      archive.append(buildReportCsv(r), { name: csvName });
+      await gate;
+      if (stopped) return { aborted: true, reason: stopReason };
+    }
+
+    // 4) 汇总 CSV 恒在最后（内容与原实现一致：按所选顺序汇总全部报告）
+    const finalGate = entryGate();
+    archive.append(buildCombinedCsv(reports), { name: '汇总_测量.csv' });
+    await finalGate;
+    if (stopped) return { aborted: true, reason: stopReason };
+    await archive.finalize();
+    return { aborted: false };
+  } catch (err) {
+    stop(err);
+    return { aborted: true, reason: err };
   }
-  archive.append(buildCombinedCsv(combined), { name: '汇总_测量.csv' });
-  await archive.finalize();
 }
 
 // 比较记录 CSV：与页面结构一致——两侧定标信息、配对细胞（两侧数值/带符号差值/相对基线变化率）、

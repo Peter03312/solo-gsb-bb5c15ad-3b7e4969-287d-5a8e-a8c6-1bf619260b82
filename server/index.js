@@ -1040,11 +1040,26 @@ app.get('/api/reports/:id/field-csv', (req, res) => {
 });
 
 // 多份选定报告导出：{ ids: string[], format: 'csv' | 'png' | 'zip' }
+// 全部请求合法性（空选择 / 超 50 份上限 / 标识类型 / 格式 / 报告存在性）都在
+// 下载响应开始前校验并以 4xx JSON 拒绝，绝不静默漏报告。
+const EXPORT_MAX_REPORTS = 50;
 app.post('/api/reports/export', async (req, res) => {
-  const { ids, format } = req.body || {};
+  const body = req.body || {};
+  const { ids, format } = body;
   if (!Array.isArray(ids) || ids.length === 0) return badRequest(res, '请至少选择一份报告');
+  if (ids.length > EXPORT_MAX_REPORTS) {
+    return badRequest(res, `批量导出最多选择 ${EXPORT_MAX_REPORTS} 份报告（当前选择 ${ids.length} 份），请求被拒绝`);
+  }
+  if (ids.some((id) => typeof id !== 'string' || !id.trim())) {
+    return badRequest(res, 'ids 必须全部是非空报告标识字符串，请求被拒绝');
+  }
+  if (format !== 'csv' && format !== 'png' && format !== 'zip') {
+    return badRequest(res, "format 必须是 'csv'、'png' 或 'zip'");
+  }
+
+  // 按选择顺序逐份取冻结快照；任一不存在即在下载开始前拒绝整批，不截断不遗漏
   const reports = [];
-  for (const id of ids.slice(0, 50)) {
+  for (const id of ids) {
     const r = getReportOr404(id);
     if (!r) return badRequest(res, `报告 ${id} 不存在或已被删除`);
     reports.push(r);
@@ -1071,18 +1086,16 @@ app.post('/api/reports/export', async (req, res) => {
       return res.send(buf);
     }
 
-    if (format === 'zip') {
-      const pngByName = {};
-      for (const r of reports) {
-        const row = db.prepare('SELECT snapshot_name FROM reports WHERE id = ?').get(r.id);
-        pngByName[r.id] = await renderAnnotatedPng(path.join(SNAP_DIR, row.snapshot_name), r);
-      }
-      return streamZip(reports, pngByName, res);
-    }
-
-    return badRequest(res, "format 必须是 'csv'、'png' 或 'zip'");
+    // ZIP：按所选顺序逐份渲染 PNG → 写入压缩流 → 释放缓存，峰值 PNG 缓存不随份数增长。
+    // 渲染/压缩失败或浏览器取消均由 streamZip 中止响应，不会交付残缺 ZIP。
+    await streamZip(reports, (r) => {
+      const row = db.prepare('SELECT snapshot_name FROM reports WHERE id = ?').get(r.id);
+      return renderAnnotatedPng(path.join(SNAP_DIR, row.snapshot_name), r);
+    }, res);
+    return;
   } catch (e) {
     if (!res.headersSent) res.status(500).json({ error: `导出失败：${e.message}` });
+    else if (!res.destroyed) res.destroy(e);
   }
 });
 
